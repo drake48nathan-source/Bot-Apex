@@ -71,8 +71,8 @@ class Pipeline:
         self.football_fetcher = FootballFetcher()
         self.model = DixonColesModel(xi=settings.DIXON_COLES_XI)
         self.selector = ValueBetSelector()
-        self.whatsapp = WhatsAppClient()
-        self.telegram = TelegramClient()
+        self.telegram = TelegramClient()      # Canal principal
+        self.whatsapp = WhatsAppClient()      # Canal secondaire optionnel
 
     async def _ensure_initialized(self) -> None:
         """Initialise la base de données et calibre le modèle au premier run."""
@@ -217,21 +217,27 @@ class Pipeline:
         return bets
 
     async def _step_send_coupon(self, bets: list[Any], stats: PipelineRunStats) -> None:
-        """Étape 4 : Envoie le coupon WhatsApp (avec fallback Telegram)."""
+        """Étape 4 : Envoie le coupon Telegram (principal) puis WhatsApp (optionnel)."""
         logger.info("Step 4: Sending coupon", n_bets=len(bets))
 
-        wa_results = await self.whatsapp.send_coupon(bets)
-        wa_success = sum(1 for r in wa_results if r.success)
-        stats.alerts_sent += wa_success
+        # ── Telegram — canal principal ───────────────────────────────────────
+        tg_results = await self.telegram.send_coupon(bets)
+        tg_success = sum(1 for r in tg_results if r)
+        stats.alerts_sent += tg_success
 
-        # Fallback Telegram si WhatsApp échoue ou n'est pas configuré
-        if wa_success == 0 or not settings.whatsapp_enabled:
-            tg_results = await self.telegram.send_coupon(bets)
-            stats.alerts_sent += sum(1 for r in tg_results if r)
+        if tg_success == 0:
+            logger.warning("Telegram send failed — check TELEGRAM_TOKEN / TELEGRAM_CHAT_ID")
+
+        # ── WhatsApp — canal secondaire optionnel ────────────────────────────
+        if settings.whatsapp_enabled:
+            wa_results = await self.whatsapp.send_coupon(bets)
+            wa_success = sum(1 for r in wa_results if r.success)
+            stats.alerts_sent += wa_success
+            logger.info("WhatsApp coupon sent", wa_sent=wa_success)
 
         logger.info(
             "Coupon sent",
-            wa_sent=wa_success,
+            tg_sent=tg_success,
             total_sent=stats.alerts_sent,
         )
 

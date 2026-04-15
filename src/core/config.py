@@ -39,7 +39,7 @@ class Settings(BaseSettings):
     # ─── Environnement ────────────────────────────────────────────────────────
     ENVIRONMENT: str = "development"
     LOG_LEVEL: str = "INFO"
-    DEMO_MODE: bool = True
+    DEMO_MODE: bool = False
     TIMEZONE: str = "Europe/Paris"
 
     # ─── Base de données ──────────────────────────────────────────────────────
