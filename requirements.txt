@@ -12,6 +12,7 @@ pandas>=2.2
 rich>=13.0
 structlog>=24.0
 tenacity>=8.0
+aiosqlite>=0.20
 
 # Dépendances de développement (commentées en prod)
 # pytest>=8.0
