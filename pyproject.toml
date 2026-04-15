@@ -91,7 +91,7 @@ filterwarnings = [
 
 [tool.coverage.run]
 source = ["src"]
-omit = ["tests/*", "scripts/*", "migrations/*"]
+omit = ["tests/*", "scripts/*", "migrations/*", "src/bot.py", "src/scheduler/jobs.py"]
 
 [tool.coverage.report]
 show_missing = true

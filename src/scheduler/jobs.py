@@ -1,112 +1,93 @@
 """
-Définition des jobs APScheduler du bot Apex V2.
-
-Ce module configure le planning des tâches récurrentes.
-Les fonctions de job sont des wrappers légers qui délèguent au Pipeline.
-
-Jobs configurés :
-
-1. job_daily_pipeline
-   Heure : BOT_SEND_HOUR:BOT_SEND_MINUTE (configurable, défaut 09:00 Europe/Paris)
-   Action : Run complet du pipeline (fetch → prédictions → sélection → envoi coupon)
-
-2. job_fetch_odds_hourly
-   Heure : Toutes les ODDS_FETCH_INTERVAL_MINUTES minutes
-   Action : Mise à jour des cotes pour les matchs J+1 à J+7
-
-3. job_fetch_odds_live
-   Heure : Toutes les ODDS_FETCH_LIVE_INTERVAL_MINUTES minutes (matchs J0 uniquement)
-   Action : Mise à jour des cotes pour les matchs du jour
-
-4. job_weekly_report
-   Heure : Chaque lundi à 09h00 (timezone configurée)
-   Action : Rapport hebdomadaire ROI + statistiques de la semaine
-
-Usage:
-    from src.scheduler.jobs import configure_scheduler
-    scheduler = configure_scheduler(pipeline)
-    scheduler.start()
+Configuration des jobs APScheduler.
 """
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any
+import asyncio
+from typing import TYPE_CHECKING
 
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.schedulers.background import BackgroundScheduler
+from apscheduler.triggers.cron import CronTrigger
+from apscheduler.triggers.interval import IntervalTrigger
+
+from src.core.config import settings
+from src.core.logging import get_logger
 
 if TYPE_CHECKING:
     from src.scheduler.pipeline import Pipeline
 
+logger = get_logger(__name__)
 
-def configure_scheduler(pipeline: "Pipeline") -> AsyncIOScheduler:
-    """
-    Configure et retourne le scheduler APScheduler avec tous les jobs.
 
-    Utilise AsyncIOScheduler pour la compatibilité avec le code async du pipeline.
-    Le scheduler utilise la timezone configurée dans Settings (TIMEZONE).
+def configure_scheduler(pipeline: "Pipeline") -> BackgroundScheduler:
+    """Configure et retourne le scheduler avec tous les jobs."""
+    scheduler = BackgroundScheduler(timezone=settings.TIMEZONE)
 
-    Args:
-        pipeline: Instance du Pipeline orchestrateur.
+    # ── Job quotidien : pipeline complet ────────────────────────────────────
+    scheduler.add_job(
+        func=_run_async(job_daily_pipeline, pipeline),
+        trigger=CronTrigger(
+            hour=settings.BOT_SEND_HOUR,
+            minute=settings.BOT_SEND_MINUTE,
+            timezone=settings.TIMEZONE,
+        ),
+        id="daily_pipeline",
+        name="Pipeline quotidien",
+        replace_existing=True,
+        misfire_grace_time=600,  # 10 min de grâce si le scheduler était arrêté
+    )
 
-    Returns:
-        AsyncIOScheduler configuré mais pas encore démarré.
-        Appeler scheduler.start() pour lancer les jobs.
-    """
-    raise NotImplementedError
+    # ── Job horaire : mise à jour des cotes ─────────────────────────────────
+    scheduler.add_job(
+        func=_run_async(job_fetch_odds_hourly, pipeline),
+        trigger=IntervalTrigger(minutes=settings.ODDS_FETCH_INTERVAL_MINUTES),
+        id="fetch_odds_hourly",
+        name="Fetch cotes (horaire)",
+        replace_existing=True,
+    )
+
+    logger.info(
+        "Scheduler configured",
+        daily_at=f"{settings.BOT_SEND_HOUR:02d}:{settings.BOT_SEND_MINUTE:02d}",
+        odds_interval_min=settings.ODDS_FETCH_INTERVAL_MINUTES,
+    )
+
+    return scheduler
+
+
+def _run_async(coro_func: "Any", *args: "Any") -> "Any":
+    """Wrapper pour exécuter une coroutine depuis un job synchrone APScheduler."""
+    def wrapper() -> None:
+        try:
+            loop = asyncio.new_event_loop()
+            loop.run_until_complete(coro_func(*args))
+        except Exception as e:
+            logger.error("Job failed", job=coro_func.__name__, error=str(e))
+        finally:
+            loop.close()
+    return wrapper
 
 
 async def job_daily_pipeline(pipeline: "Pipeline") -> None:
-    """
-    Job quotidien : exécute le pipeline complet.
-
-    Wrapper autour de pipeline.run_daily() avec logging du résultat.
-    Les erreurs sont capturées pour ne pas faire planter le scheduler.
-
-    Args:
-        pipeline: Instance du Pipeline.
-    """
-    raise NotImplementedError
+    """Job quotidien : exécute le pipeline complet."""
+    logger.info("Job: daily_pipeline starting")
+    try:
+        stats = await pipeline.run_daily()
+        logger.info(
+            "Job: daily_pipeline done",
+            status=stats.status.value,
+            bets=stats.bets_selected,
+        )
+    except Exception as e:
+        logger.error("Job: daily_pipeline crashed", error=str(e))
 
 
 async def job_fetch_odds_hourly(pipeline: "Pipeline") -> None:
-    """
-    Job horaire : met à jour les cotes pour les matchs J+1 à J+7.
-
-    Ne génère pas de prédictions, uniquement de la collecte de données.
-    Permet d'avoir des cotes fraîches pour les alertes de line movement.
-
-    Args:
-        pipeline: Instance du Pipeline.
-    """
-    raise NotImplementedError
-
-
-async def job_fetch_odds_live(pipeline: "Pipeline") -> None:
-    """
-    Job live (toutes les 15 min) : cotes des matchs du jour.
-
-    Déclenche une alerte WhatsApp si une cote bouge de plus de 10%
-    sur un pari déjà dans le coupon du jour.
-
-    Args:
-        pipeline: Instance du Pipeline.
-    """
-    raise NotImplementedError
-
-
-async def job_weekly_report(pipeline: "Pipeline") -> None:
-    """
-    Job hebdomadaire : rapport de performance de la semaine.
-
-    Calcule :
-    - ROI de la semaine (pnl / total misé)
-    - Win rate (paris gagnés / paris réglés)
-    - Meilleur pari de la semaine
-    - Pire pari de la semaine
-
-    Envoie le rapport via WhatsApp + Telegram.
-
-    Args:
-        pipeline: Instance du Pipeline.
-    """
-    raise NotImplementedError
+    """Job horaire : met à jour les cotes pour les matchs futurs."""
+    logger.info("Job: fetch_odds_hourly starting")
+    try:
+        events = await pipeline.odds_fetcher.fetch_all_leagues()
+        logger.info("Job: fetch_odds_hourly done", n_events=len(events))
+    except Exception as e:
+        logger.error("Job: fetch_odds_hourly failed", error=str(e))

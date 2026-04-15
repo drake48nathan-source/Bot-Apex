@@ -1,57 +1,29 @@
 """
 Modèle de prédiction Dixon-Coles pour le football.
 
-Référence académique : Dixon, M.J. & Coles, S.G. (1997).
-"Modelling Association Football Scores and Inefficiencies in the Football Betting Market."
-Journal of the Royal Statistical Society, Series C, 46(2), 265-280.
-
-Le modèle fait les hypothèses suivantes :
-- Le nombre de buts marqués par chaque équipe suit une distribution de Poisson
-- Les paramètres d'attaque (alpha) et de défense (beta) sont propres à chaque équipe
-- Un avantage à domicile (gamma) est global à toutes les équipes
-- Une correction (rho) est appliquée pour les scores faibles (0-0, 1-0, 0-1, 1-1)
-  qui sont sous/sur-représentés par rapport à une distribution Poisson pure
-- Les matchs récents sont pondérés plus fortement via un paramètre de décroissance (xi)
-
-Paramètres du modèle :
-- alpha_i  : force d'attaque de l'équipe i (>0)
-- beta_i   : force défensive de l'équipe i (>0, petit = bonne défense)
-- gamma    : facteur d'avantage à domicile (>1 typiquement)
-- rho      : paramètre de correction Dixon-Coles (typiquement -0.1 à -0.2)
-
-Prédiction :
-    lambda_home = alpha_home * beta_away * gamma
-    lambda_away = alpha_away * beta_home
-
-    P(home=i, away=j) = tau(i,j,rho) * Poisson(i, lambda_home) * Poisson(j, lambda_away)
-
-Usage:
-    model = DixonColesModel()
-    model.fit(historical_matches_df)
-    score_matrix = model.predict_score_matrix("Arsenal", "Chelsea")
-    # score_matrix[2][1] = P(Arsenal 2 - Chelsea 1)
+Référence : Dixon & Coles (1997). Modèle Poisson bivarié avec correction rho
+pour les scores faibles et décroissance temporelle xi.
 """
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
+from datetime import datetime, date
 from typing import Any
 
 import numpy as np
 from numpy.typing import NDArray
+from scipy.optimize import minimize
+from scipy.stats import poisson
+
+from src.core.logging import get_logger
+
+logger = get_logger(__name__)
 
 
 @dataclass
 class TeamParams:
-    """
-    Paramètres Dixon-Coles calibrés pour une équipe.
-
-    Attributes:
-        team_name: Nom de l'équipe (doit correspondre aux noms dans les matchs).
-        attack: Force offensive alpha_i. Valeur > 1 = bonne attaque, < 1 = faible.
-        defense: Force défensive beta_i. Valeur < 1 = bonne défense, > 1 = faible.
-    """
-
     team_name: str
     attack: float
     defense: float
@@ -59,23 +31,9 @@ class TeamParams:
 
 @dataclass
 class ModelFitResult:
-    """
-    Résultat de la calibration du modèle.
-
-    Attributes:
-        team_params: Dictionnaire {team_name: TeamParams} pour chaque équipe.
-        home_advantage: Facteur d'avantage à domicile (gamma).
-        rho: Paramètre de correction Dixon-Coles.
-        log_likelihood: Log-vraisemblance finale (meilleur = plus proche de 0).
-        n_matches: Nombre de matchs utilisés pour l'entraînement.
-        convergence: True si l'optimiseur scipy a convergé normalement.
-        brier_score: Score de Brier sur les données de validation (si disponibles).
-        log_loss: Log-loss sur les données de validation (si disponibles).
-    """
-
     team_params: dict[str, TeamParams] = field(default_factory=dict)
-    home_advantage: float = 1.0
-    rho: float = -0.1
+    home_advantage: float = 1.35
+    rho: float = -0.10
     log_likelihood: float = 0.0
     n_matches: int = 0
     convergence: bool = False
@@ -85,209 +43,288 @@ class ModelFitResult:
 
 class DixonColesModel:
     """
-    Implémentation du modèle Dixon-Coles pour la prédiction de scores football.
+    Implémentation du modèle Dixon-Coles.
 
-    Ce modèle doit être calibré (fit) avant de pouvoir faire des prédictions.
-    Les paramètres calibrés peuvent être sauvegardés/chargés depuis la base de données.
+    Usage:
+        model = DixonColesModel()
+        model.fit(historical_matches)
+        matrix = model.predict_score_matrix("Arsenal", "Chelsea")
+        # matrix[2][1] = P(Arsenal 2 – Chelsea 1)
     """
 
     MAX_GOALS: int = 10
-    """Score maximum considéré dans la matrice de probabilités (0 à MAX_GOALS)."""
 
     def __init__(self, xi: float = 0.0018) -> None:
-        """
-        Initialise le modèle avec le paramètre de décroissance temporelle.
-
-        Args:
-            xi: Paramètre de décroissance temporelle ξ. Un match joué il y a
-                T jours a un poids de exp(-xi * T). Valeur typique : 0.0018
-                (les matchs de plus de 3 ans ont un poids quasi nul).
-        """
         self.xi = xi
         self._fit_result: ModelFitResult | None = None
 
     @property
     def is_fitted(self) -> bool:
-        """Retourne True si le modèle a été calibré."""
         return self._fit_result is not None
 
-    def fit(self, matches: list[dict[str, Any]], reference_date: str | None = None) -> ModelFitResult:
-        """
-        Calibre le modèle Dixon-Coles sur des données historiques de matchs.
+    # ─── Calibration ──────────────────────────────────────────────────────────
 
-        Utilise scipy.optimize.minimize (méthode L-BFGS-B) pour maximiser
-        la log-vraisemblance pondérée par la décroissance temporelle.
+    def fit(
+        self,
+        matches: list[dict[str, Any]],
+        reference_date: str | datetime | date | None = None,
+    ) -> ModelFitResult:
+        """
+        Calibre le modèle sur des matchs historiques.
 
         Args:
-            matches: Liste de dicts avec les clés :
-                - "home_team" (str) : nom équipe domicile
-                - "away_team" (str) : nom équipe extérieure
-                - "home_score" (int) : buts marqués à domicile
-                - "away_score" (int) : buts encaissés à domicile
-                - "date" (str | datetime) : date du match
+            matches: [{"home_team", "away_team", "home_score", "away_score", "date"}, ...]
             reference_date: Date de référence pour la décroissance temporelle.
-                           Si None, utilise la date du jour.
-
-        Returns:
-            ModelFitResult avec les paramètres calibrés et les métriques.
-
-        Raises:
-            ValueError: Si `matches` est vide ou si les données sont mal formées.
-            RuntimeError: Si l'optimisation scipy échoue à converger.
         """
-        raise NotImplementedError
+        if not matches:
+            raise ValueError("matches list is empty")
+
+        # Référence temporelle
+        if reference_date is None:
+            ref = date.today()
+        elif isinstance(reference_date, datetime):
+            ref = reference_date.date()
+        elif isinstance(reference_date, str):
+            ref = date.fromisoformat(reference_date[:10])
+        else:
+            ref = reference_date
+
+        # Teams
+        teams = sorted(set(
+            [m["home_team"] for m in matches] + [m["away_team"] for m in matches]
+        ))
+        n_teams = len(teams)
+        team_idx = {t: i for i, t in enumerate(teams)}
+
+        # Poids temporels
+        weights = self._compute_temporal_weights(matches, ref)
+
+        logger.info(
+            "Fitting Dixon-Coles",
+            n_matches=len(matches),
+            n_teams=n_teams,
+            xi=self.xi,
+        )
+
+        # Paramètres initiaux : attack=1, defense=1, gamma=1.35, rho=-0.1
+        # Layout : [alpha_0..alpha_n-1, beta_0..beta_n-1, gamma, rho]
+        x0 = np.ones(2 * n_teams + 2)
+        x0[-2] = 1.35   # gamma (home advantage)
+        x0[-1] = -0.10  # rho
+
+        # Bornes
+        bounds = (
+            [(0.01, 10.0)] * n_teams      # attack ≥ 0.01
+            + [(0.01, 10.0)] * n_teams    # defense ≥ 0.01
+            + [(1.0, 3.0)]                # gamma ∈ [1, 3]
+            + [(-0.9, 0.0)]               # rho ∈ [-0.9, 0]
+        )
+
+        result = minimize(
+            fun=self._neg_log_likelihood,
+            x0=x0,
+            args=(matches, weights, team_idx, n_teams),
+            method="L-BFGS-B",
+            bounds=bounds,
+            options={"maxiter": 1000, "ftol": 1e-9},
+        )
+
+        # Parse les paramètres optimisés
+        attacks = result.x[:n_teams]
+        defenses = result.x[n_teams: 2 * n_teams]
+        gamma = float(result.x[-2])
+        rho = float(result.x[-1])
+
+        team_params = {
+            team: TeamParams(team_name=team, attack=float(attacks[i]), defense=float(defenses[i]))
+            for team, i in team_idx.items()
+        }
+
+        self._fit_result = ModelFitResult(
+            team_params=team_params,
+            home_advantage=gamma,
+            rho=rho,
+            log_likelihood=float(-result.fun),
+            n_matches=len(matches),
+            convergence=result.success,
+        )
+
+        logger.info(
+            "Dixon-Coles fitted",
+            convergence=result.success,
+            log_likelihood=round(float(-result.fun), 2),
+            gamma=round(gamma, 3),
+            rho=round(rho, 3),
+        )
+
+        return self._fit_result
+
+    # ─── Prédiction ───────────────────────────────────────────────────────────
 
     def predict_score_matrix(
         self, home_team: str, away_team: str
     ) -> NDArray[np.float64]:
         """
-        Calcule la matrice de probabilités de scores pour un match.
+        Retourne la matrice de probabilités de scores (MAX_GOALS+1) × (MAX_GOALS+1).
 
-        Retourne une matrice (MAX_GOALS+1) x (MAX_GOALS+1) où l'élément [i][j]
-        représente la probabilité que l'équipe domicile marque i buts et
-        l'équipe extérieure marque j buts.
-
-        La correction Dixon-Coles (tau) est appliquée pour les scores faibles.
-        La somme de tous les éléments de la matrice est égale à 1.0.
-
-        Args:
-            home_team: Nom de l'équipe domicile (doit être dans les paramètres calibrés).
-            away_team: Nom de l'équipe extérieure (doit être dans les paramètres calibrés).
-
-        Returns:
-            Matrice numpy de forme (MAX_GOALS+1, MAX_GOALS+1) avec dtype float64.
-
-        Raises:
-            RuntimeError: Si le modèle n'a pas encore été calibré (is_fitted == False).
-            KeyError: Si home_team ou away_team n'est pas dans les équipes calibrées.
+        matrix[i][j] = P(home scores i goals, away scores j goals)
+        sum(matrix) = 1.0
         """
-        raise NotImplementedError
+        if not self.is_fitted or self._fit_result is None:
+            raise RuntimeError("Model not fitted. Call fit() first.")
 
-    def _compute_lambda(self, home_team: str, away_team: str) -> tuple[float, float]:
-        """
-        Calcule les taux de Poisson (lambda) pour les deux équipes.
+        fr = self._fit_result
 
-        lambda_home = alpha_home * beta_away * gamma
-        lambda_away = alpha_away * beta_home
+        # Si une équipe est inconnue, utiliser des paramètres moyens
+        def get_params(team: str) -> TeamParams:
+            if team in fr.team_params:
+                return fr.team_params[team]
+            avg_attack = np.mean([p.attack for p in fr.team_params.values()])
+            avg_defense = np.mean([p.defense for p in fr.team_params.values()])
+            logger.warning("Unknown team, using average params", team=team)
+            return TeamParams(team, float(avg_attack), float(avg_defense))
 
-        Args:
-            home_team: Nom de l'équipe domicile.
-            away_team: Nom de l'équipe extérieure.
+        home_p = get_params(home_team)
+        away_p = get_params(away_team)
 
-        Returns:
-            Tuple (lambda_home, lambda_away).
-        """
-        raise NotImplementedError
+        lambda_h = home_p.attack * away_p.defense * fr.home_advantage
+        lambda_a = away_p.attack * home_p.defense
+
+        matrix = np.zeros((self.MAX_GOALS + 1, self.MAX_GOALS + 1), dtype=np.float64)
+
+        for i in range(self.MAX_GOALS + 1):
+            for j in range(self.MAX_GOALS + 1):
+                tau = self._tau(i, j, fr.rho, lambda_h, lambda_a)
+                matrix[i][j] = (
+                    tau
+                    * poisson.pmf(i, lambda_h)
+                    * poisson.pmf(j, lambda_a)
+                )
+
+        # Normalisation (la somme devrait être très proche de 1 déjà)
+        total = matrix.sum()
+        if total > 0:
+            matrix /= total
+
+        return matrix
+
+    # ─── Méthodes privées ─────────────────────────────────────────────────────
 
     @staticmethod
-    def _tau(home_goals: int, away_goals: int, rho: float, lambda_h: float, lambda_a: float) -> float:
-        """
-        Facteur de correction Dixon-Coles pour les scores faibles.
+    def _tau(
+        home_goals: int, away_goals: int, rho: float, lambda_h: float, lambda_a: float
+    ) -> float:
+        """Facteur de correction Dixon-Coles pour les scores faibles."""
+        if home_goals == 0 and away_goals == 0:
+            return 1.0 - lambda_h * lambda_a * rho
+        if home_goals == 1 and away_goals == 0:
+            return 1.0 + lambda_a * rho
+        if home_goals == 0 and away_goals == 1:
+            return 1.0 + lambda_h * rho
+        if home_goals == 1 and away_goals == 1:
+            return 1.0 - rho
+        return 1.0
 
-        Corrige la déviation par rapport à la distribution de Poisson pure
-        pour les quatre scores faibles : 0-0, 1-0, 0-1, 1-1.
+    def _neg_log_likelihood(
+        self,
+        params: NDArray[np.float64],
+        matches: list[dict[str, Any]],
+        weights: NDArray[np.float64],
+        team_idx: dict[str, int],
+        n_teams: int,
+    ) -> float:
+        """Log-vraisemblance négative pondérée (à minimiser)."""
+        attacks = params[:n_teams]
+        defenses = params[n_teams: 2 * n_teams]
+        gamma = params[-2]
+        rho = params[-1]
 
-        La formule exacte est :
-            tau(0,0) = 1 - lambda_h * lambda_a * rho
-            tau(1,0) = 1 + lambda_a * rho
-            tau(0,1) = 1 + lambda_h * rho
-            tau(1,1) = 1 - rho
-            tau(i,j) = 1 pour tous les autres scores
+        total = 0.0
+        for match, w in zip(matches, weights):
+            hi = team_idx.get(match["home_team"], -1)
+            ai = team_idx.get(match["away_team"], -1)
+            if hi < 0 or ai < 0:
+                continue
 
-        Args:
-            home_goals: Buts de l'équipe domicile.
-            away_goals: Buts de l'équipe extérieure.
-            rho: Paramètre de correction (typiquement négatif).
-            lambda_h: Taux Poisson équipe domicile.
-            lambda_a: Taux Poisson équipe extérieure.
+            lambda_h = attacks[hi] * defenses[ai] * gamma
+            lambda_a = attacks[ai] * defenses[hi]
+            hg = int(match["home_score"])
+            ag = int(match["away_score"])
 
-        Returns:
-            Facteur tau (float) à appliquer à la probabilité Poisson.
-        """
-        raise NotImplementedError
+            tau = self._tau(hg, ag, rho, lambda_h, lambda_a)
+            if tau <= 0:
+                return 1e10  # Pénalité
 
-    def _log_likelihood(self, params: NDArray[np.float64], matches: list[dict], weights: NDArray[np.float64]) -> float:
-        """
-        Calcule la log-vraisemblance négative du modèle (à minimiser).
+            log_p = (
+                np.log(tau)
+                + poisson.logpmf(hg, lambda_h)
+                + poisson.logpmf(ag, lambda_a)
+            )
+            total += w * log_p
 
-        Utilisée par scipy.optimize.minimize comme fonction objectif.
-        Applique les poids temporels pour donner plus d'importance aux matchs récents.
-
-        Args:
-            params: Vecteur de paramètres aplati [alpha_1, ..., alpha_n, beta_1, ..., beta_n, gamma, rho].
-            matches: Liste des matchs historiques.
-            weights: Vecteur de poids temporels (exp(-xi * days_ago)).
-
-        Returns:
-            Log-vraisemblance négative (float). Plus proche de 0 = meilleur modèle.
-        """
-        raise NotImplementedError
+        return -total  # On minimise le négatif
 
     def _compute_temporal_weights(
-        self, matches: list[dict], reference_date: Any
+        self, matches: list[dict[str, Any]], ref: date
     ) -> NDArray[np.float64]:
-        """
-        Calcule les poids de décroissance temporelle pour chaque match.
+        """Calcule exp(-xi * jours) pour chaque match."""
+        weights = np.ones(len(matches))
+        for i, m in enumerate(matches):
+            try:
+                match_date_str = str(m.get("date", ""))[:10]
+                if match_date_str:
+                    match_date = date.fromisoformat(match_date_str)
+                    days_ago = max(0, (ref - match_date).days)
+                    weights[i] = np.exp(-self.xi * days_ago)
+            except Exception:
+                weights[i] = 0.5
+        return weights
 
-        weight_i = exp(-xi * days_since_match_i)
-
-        Les matchs récents ont un poids proche de 1.0.
-        Les matchs anciens ont un poids proche de 0.0.
-
-        Args:
-            matches: Liste des matchs avec leurs dates.
-            reference_date: Date de référence pour le calcul de l'ancienneté.
-
-        Returns:
-            Tableau numpy de poids, de même longueur que `matches`.
-        """
-        raise NotImplementedError
-
-    def save_params(self, db_session: Any, league: str, version: str = "v1") -> None:
-        """
-        Sauvegarde les paramètres calibrés en base de données (table model_params).
-
-        Sérialise le ModelFitResult en JSON et l'enregistre avec les métadonnées
-        (league, version, métriques de validation).
-
-        Args:
-            db_session: Session SQLAlchemy active.
-            league: Identifiant de la ligue (ex: "EPL").
-            version: Version du modèle pour le versioning.
-
-        Raises:
-            RuntimeError: Si le modèle n'est pas calibré.
-        """
-        raise NotImplementedError
+    def to_dict(self) -> dict[str, Any]:
+        """Sérialise les paramètres en dict (pour sauvegarde JSON)."""
+        if not self._fit_result:
+            raise RuntimeError("Model not fitted")
+        fr = self._fit_result
+        return {
+            "xi": self.xi,
+            "home_advantage": fr.home_advantage,
+            "rho": fr.rho,
+            "log_likelihood": fr.log_likelihood,
+            "n_matches": fr.n_matches,
+            "convergence": fr.convergence,
+            "team_params": {
+                name: {"attack": p.attack, "defense": p.defense}
+                for name, p in fr.team_params.items()
+            },
+        }
 
     @classmethod
-    def load_params(cls, db_session: Any, league: str) -> "DixonColesModel":
-        """
-        Charge les paramètres calibrés depuis la base de données.
-
-        Cherche la version active (is_active=True) pour la ligue donnée.
-        Retourne une instance DixonColesModel pré-calibrée, prête pour predict_score_matrix().
-
-        Args:
-            db_session: Session SQLAlchemy active.
-            league: Identifiant de la ligue (ex: "EPL").
-
-        Returns:
-            Instance DixonColesModel avec _fit_result chargé.
-
-        Raises:
-            ValueError: Si aucun paramètre actif n'est trouvé pour cette ligue.
-        """
-        raise NotImplementedError
+    def from_dict(cls, data: dict[str, Any]) -> "DixonColesModel":
+        """Reconstruit un modèle depuis un dict sérialisé."""
+        model = cls(xi=data.get("xi", 0.0018))
+        team_params = {
+            name: TeamParams(name, v["attack"], v["defense"])
+            for name, v in data.get("team_params", {}).items()
+        }
+        model._fit_result = ModelFitResult(
+            team_params=team_params,
+            home_advantage=data.get("home_advantage", 1.35),
+            rho=data.get("rho", -0.10),
+            log_likelihood=data.get("log_likelihood", 0.0),
+            n_matches=data.get("n_matches", 0),
+            convergence=data.get("convergence", True),
+        )
+        return model
 
     def get_team_strengths(self) -> dict[str, dict[str, float]]:
-        """
-        Retourne un classement des équipes par force offensive et défensive.
-
-        Utile pour le debugging et l'analyse.
-
-        Returns:
-            Dict {team_name: {"attack": float, "defense": float, "overall": float}}
-            Trié par "overall" décroissant.
-        """
-        raise NotImplementedError
+        """Retourne un classement des équipes par force."""
+        if not self._fit_result:
+            return {}
+        result = {}
+        for name, p in self._fit_result.team_params.items():
+            result[name] = {
+                "attack": round(p.attack, 3),
+                "defense": round(p.defense, 3),
+                "overall": round(p.attack / p.defense, 3),
+            }
+        return dict(sorted(result.items(), key=lambda x: -x[1]["overall"]))

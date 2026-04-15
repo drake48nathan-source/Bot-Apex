@@ -2,37 +2,32 @@
 Configuration de la base de données SQLAlchemy.
 
 Expose :
-- `engine` : le moteur de connexion (SQLite en Phase 1)
-- `SessionLocal` : factory de sessions SQLAlchemy
-- `Base` : classe de base pour tous les modèles ORM
-- `get_db()` : context manager pour obtenir une session dans un job
-
-La base de données est créée automatiquement au premier accès si elle n'existe pas.
-En Phase 3, remplacer DATABASE_URL par une URL PostgreSQL sans changer ce fichier.
+- `Base`         : classe de base pour tous les modèles ORM
+- `get_db()`     : context manager pour obtenir une session
+- `init_db()`    : crée les tables (développement seulement)
+- `engine`       : moteur SQLAlchemy global
 
 Usage:
     from src.core.database import get_db
     with get_db() as db:
-        matches = db.query(Match).all()
+        db.add(match)
+        db.commit()
 """
 
 from __future__ import annotations
 
+import os
 from collections.abc import Generator
 from contextlib import contextmanager
 
-from sqlalchemy import Engine, create_engine, event
+from sqlalchemy import Engine, event, create_engine, text
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
+
+from src.core.config import settings
 
 
 class Base(DeclarativeBase):
-    """
-    Classe de base pour tous les modèles SQLAlchemy du projet.
-
-    Tous les modèles dans src/data/models/ doivent hériter de cette classe.
-    Alembic utilise également cette Base pour autogénérer les migrations.
-    """
-
+    """Classe de base pour tous les modèles SQLAlchemy du projet."""
     pass
 
 
@@ -40,45 +35,54 @@ def create_db_engine(database_url: str) -> Engine:
     """
     Crée et configure le moteur SQLAlchemy.
 
-    Pour SQLite : active le mode WAL (Write-Ahead Logging) pour de meilleures
-    performances en lecture concurrente, et active les foreign keys (désactivées
-    par défaut dans SQLite).
-
-    Pour PostgreSQL : configure le pool de connexions (pool_size, max_overflow).
-
-    Args:
-        database_url: URL de connexion SQLAlchemy (ex: "sqlite:///./data/apex_bot.db")
-
-    Returns:
-        Engine SQLAlchemy configuré et prêt à l'emploi.
+    Pour SQLite : active WAL mode et foreign keys.
+    Pour PostgreSQL : configure le pool de connexions.
     """
-    raise NotImplementedError
+    is_sqlite = database_url.startswith("sqlite")
+
+    connect_args: dict = {}
+    if is_sqlite:
+        connect_args["check_same_thread"] = False
+        # Crée le répertoire si nécessaire
+        if "///" in database_url:
+            db_path = database_url.split("///")[1]
+            db_dir = os.path.dirname(db_path)
+            if db_dir:
+                os.makedirs(db_dir, exist_ok=True)
+
+    engine = create_engine(
+        database_url,
+        connect_args=connect_args,
+        echo=settings.LOG_LEVEL == "DEBUG",
+    )
+
+    if is_sqlite:
+        _configure_sqlite(engine)
+
+    return engine
 
 
 def _configure_sqlite(engine: Engine) -> None:
-    """
-    Configure les pragmas SQLite nécessaires à la performance et à l'intégrité.
+    """Active les pragmas SQLite pour la performance et l'intégrité."""
 
-    Appelé automatiquement lors de la création d'une connexion SQLite.
-    Active : foreign_keys, WAL journal mode, synchronous=NORMAL.
-
-    Args:
-        engine: Engine SQLite à configurer.
-    """
-    raise NotImplementedError
+    @event.listens_for(engine, "connect")
+    def set_sqlite_pragma(dbapi_conn: object, connection_record: object) -> None:  # type: ignore[misc]
+        cursor = dbapi_conn.cursor()  # type: ignore[union-attr]
+        cursor.execute("PRAGMA foreign_keys=ON")
+        cursor.execute("PRAGMA journal_mode=WAL")
+        cursor.execute("PRAGMA synchronous=NORMAL")
+        cursor.execute("PRAGMA cache_size=-64000")  # 64 MB cache
+        cursor.close()
 
 
 def create_session_factory(engine: Engine) -> sessionmaker[Session]:
-    """
-    Crée la factory de sessions SQLAlchemy.
-
-    Args:
-        engine: Engine SQLAlchemy créé par create_db_engine().
-
-    Returns:
-        sessionmaker configuré avec autocommit=False et autoflush=False.
-    """
-    raise NotImplementedError
+    """Crée la factory de sessions SQLAlchemy."""
+    return sessionmaker(
+        bind=engine,
+        autocommit=False,
+        autoflush=False,
+        expire_on_commit=False,
+    )
 
 
 @contextmanager
@@ -86,39 +90,41 @@ def get_db() -> Generator[Session, None, None]:
     """
     Context manager pour obtenir une session de base de données.
 
-    La session est automatiquement fermée après le bloc with.
-    En cas d'exception, la transaction est rollback automatiquement.
+    Rollback automatique en cas d'exception, fermeture garantie.
 
     Usage:
         with get_db() as db:
-            matches = db.query(Match).filter(Match.status == "scheduled").all()
-            db.add(new_match)
+            db.add(obj)
             db.commit()
-
-    Yields:
-        Session SQLAlchemy active.
-
-    Raises:
-        SQLAlchemyError: En cas d'erreur de base de données (reraisée après rollback).
     """
-    raise NotImplementedError
+    session = SessionLocal()
+    try:
+        yield session
+    except Exception:
+        session.rollback()
+        raise
+    finally:
+        session.close()
 
 
 def init_db() -> None:
     """
     Crée toutes les tables définies dans les modèles SQLAlchemy.
 
-    À appeler uniquement en développement ou dans les scripts de bootstrap.
-    En production, utiliser les migrations Alembic (`alembic upgrade head`).
-
-    Note: Import explicite de tous les modèles nécessaire pour que SQLAlchemy
-    les découvre avant d'appeler Base.metadata.create_all().
+    À utiliser uniquement en développement ou dans les tests.
+    En production : utiliser `alembic upgrade head`.
     """
-    raise NotImplementedError
+    # Import explicite de tous les modèles pour que SQLAlchemy les découvre
+    import src.data.models  # noqa: F401
+
+    Base.metadata.create_all(bind=engine)
 
 
-# ─── Initialisation du module ──────────────────────────────────────────────────
-# Ces objets sont initialisés au chargement du module et partagés globalement.
-# engine et SessionLocal sont créés à partir des settings.
-engine: Engine
-SessionLocal: sessionmaker[Session]
+def drop_all_tables() -> None:
+    """Supprime toutes les tables. À utiliser UNIQUEMENT dans les tests."""
+    Base.metadata.drop_all(bind=engine)
+
+
+# ─── Initialisation globale ────────────────────────────────────────────────────
+engine: Engine = create_db_engine(settings.DATABASE_URL)
+SessionLocal: sessionmaker[Session] = create_session_factory(engine)

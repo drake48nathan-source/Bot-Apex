@@ -1,36 +1,10 @@
 """
 Pipeline orchestrateur principal du bot Apex V2.
 
-Ce module est le point d'entrée de l'application en production.
-Il instancie et orchestre tous les composants dans le bon ordre,
-gère les erreurs de manière centralisée et fournit des logs structurés
-pour chaque étape d'exécution.
-
-Modes d'exécution :
-1. Scheduler complet (production) : `python -m src.scheduler.pipeline`
-   → Lance APScheduler avec tous les jobs configurés (quotidien, horaire, hebdo)
-   → Tourne indéfiniment jusqu'à interruption (SIGTERM/SIGINT)
-
-2. Run unique (test/debug) : `python -m src.scheduler.pipeline --run-once`
-   → Exécute le pipeline quotidien une seule fois et s'arrête
-
-Pipeline quotidien (exécuté à 06h00 UTC) :
-    Étape 1 : Fetch des cotes (The Odds API) pour les matchs J0 à J+7
-    Étape 2 : Fetch des stats football (API-Football) pour les équipes des matchs J0
-    Étape 3 : Prédiction Dixon-Coles pour chaque match J0
-    Étape 4 : Calcul des value bets (démarginisation + EV + Kelly)
-    Étape 5 : Sélection des top N value bets du jour
-    Étape 6 : Formatage du coupon WhatsApp
-    Étape 7 : Envoi WhatsApp (avec fallback Telegram si échec)
-    Étape 8 : Sauvegarde du run en base (table pipeline_runs)
-
-Usage:
-    # Production
-    python -m src.scheduler.pipeline
-
-    # Test
-    python -m src.scheduler.pipeline --run-once
-    python -m src.scheduler.pipeline --run-once --dry-run  # Sans envoi WhatsApp
+Modes :
+  python -m src.scheduler.pipeline           → scheduler complet
+  python -m src.scheduler.pipeline --run-once → run unique
+  python -m src.scheduler.pipeline --run-once --dry-run → sans envoi messages
 """
 
 from __future__ import annotations
@@ -40,40 +14,28 @@ import asyncio
 import signal
 import sys
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import Enum
 from typing import Any
 
+from src.core.config import settings
+from src.core.database import get_db, init_db
+from src.core.logging import add_context, clear_context, get_logger
+
+logger = get_logger(__name__)
+
 
 class PipelineStatus(Enum):
-    """Statuts possibles d'un run de pipeline."""
-
     RUNNING = "running"
     SUCCESS = "success"
-    PARTIAL_FAILURE = "partial_failure"  # Certaines étapes ont échoué, mais le message a été envoyé
-    FAILURE = "failure"  # Échec critique, message non envoyé
+    PARTIAL_FAILURE = "partial_failure"
+    FAILURE = "failure"
 
 
 @dataclass
 class PipelineRunStats:
-    """
-    Statistiques collectées pendant un run de pipeline.
-
-    Attributes:
-        run_type: Type de run ('daily', 'hourly_odds', 'weekly_report').
-        started_at: Timestamp de début du run.
-        finished_at: Timestamp de fin (None si en cours).
-        status: Statut final du run.
-        matches_fetched: Nombre de matchs récupérés depuis les APIs.
-        predictions_made: Nombre de prédictions générées par le modèle.
-        bets_selected: Nombre de value bets sélectionnés pour le coupon.
-        alerts_sent: Nombre de messages WhatsApp/Telegram envoyés avec succès.
-        errors: Liste des erreurs non fatales rencontrées.
-        error_message: Message d'erreur principal si le run a échoué.
-    """
-
     run_type: str
-    started_at: datetime = field(default_factory=datetime.utcnow)
+    started_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     finished_at: datetime | None = None
     status: PipelineStatus = PipelineStatus.RUNNING
     matches_fetched: int = 0
@@ -85,212 +47,281 @@ class PipelineRunStats:
 
     @property
     def duration_seconds(self) -> float | None:
-        """Durée du run en secondes. None si pas encore terminé."""
         if self.finished_at is None:
             return None
         return (self.finished_at - self.started_at).total_seconds()
 
 
 class Pipeline:
-    """
-    Orchestrateur principal du bot Apex V2.
-
-    Instancie et coordonne tous les composants :
-    - OddsFetcher et FootballFetcher pour la collecte
-    - DixonColesModel pour les prédictions
-    - ValueCalculator et ValueBetSelector pour la sélection
-    - WhatsAppClient et TelegramClient pour la messagerie
-
-    Le scheduler APScheduler est configuré dans run() et appelle
-    run_daily() selon le planning configuré dans settings.
-    """
+    """Orchestrateur principal du bot Apex V2."""
 
     def __init__(self, dry_run: bool = False) -> None:
-        """
-        Initialise le pipeline et tous ses composants.
+        self.dry_run = dry_run
+        self._initialized = False
 
-        Args:
-            dry_run: Si True, skip l'envoi des messages WhatsApp/Telegram.
-                    Utile pour le test et le debug. Les prédictions sont quand
-                    même calculées et sauvegardées en base.
-        """
-        raise NotImplementedError
+        # Import ici pour éviter les imports circulaires au démarrage
+        from src.data.fetchers.football import FootballFetcher
+        from src.data.fetchers.odds import OddsFetcher
+        from src.messaging.telegram import TelegramClient
+        from src.messaging.whatsapp import WhatsAppClient
+        from src.models.dixon_coles import DixonColesModel
+        from src.selection.selector import ValueBetSelector
+
+        self.odds_fetcher = OddsFetcher()
+        self.football_fetcher = FootballFetcher()
+        self.model = DixonColesModel(xi=settings.DIXON_COLES_XI)
+        self.selector = ValueBetSelector()
+        self.whatsapp = WhatsAppClient()
+        self.telegram = TelegramClient()
+
+    async def _ensure_initialized(self) -> None:
+        """Initialise la base de données et calibre le modèle au premier run."""
+        if self._initialized:
+            return
+
+        # Créer les tables si elles n'existent pas
+        init_db()
+        logger.info("Database initialized")
+
+        # Calibrer le modèle avec des données historiques
+        await self._calibrate_model()
+        self._initialized = True
+
+    async def _calibrate_model(self) -> None:
+        """Télécharge les données historiques et calibre Dixon-Coles."""
+        logger.info("Calibrating Dixon-Coles model...")
+        all_matches: list[dict] = []
+
+        for league in settings.football_leagues_list:
+            for season_offset in range(settings.DIXON_COLES_SEASONS):
+                season = 2024 - season_offset
+                try:
+                    matches = await self.football_fetcher.fetch_historical_matches(league, season)
+                    all_matches.extend(matches)
+                except Exception as e:
+                    logger.warning("Failed to fetch historical data", league=league, season=season, error=str(e))
+
+        if all_matches:
+            self.model.fit(all_matches)
+            logger.info("Model calibrated", n_matches=len(all_matches))
+        else:
+            logger.error("No historical data available for calibration")
 
     async def run_daily(self) -> PipelineRunStats:
         """
         Exécute le pipeline quotidien complet.
 
-        Collecte les données → Génère les prédictions → Sélectionne les value bets
-        → Envoie le coupon WhatsApp → Sauvegarde les stats.
-
-        En cas d'erreur sur une étape non-critique (ex: certains matchs échouent),
-        continue avec les données disponibles et note l'erreur dans les stats.
-
-        En cas d'erreur critique (ex: aucune donnée récupérée), bascule en FAILURE
-        et envoie une alerte au canal admin (Telegram).
-
-        Returns:
-            PipelineRunStats avec les statistiques complètes du run.
+        Étapes :
+        1. Fetch des cotes (The Odds API)
+        2. Prédictions Dixon-Coles
+        3. Sélection des value bets
+        4. Envoi du coupon WhatsApp + Telegram
+        5. Sauvegarde des stats
         """
-        raise NotImplementedError
+        stats = PipelineRunStats(run_type="daily")
+        run_id = stats.started_at.strftime("%Y%m%d_%H%M%S")
+        add_context(pipeline_run_id=run_id)
 
-    async def _step_fetch_odds(self, stats: PipelineRunStats) -> list[Any]:
-        """
-        Étape 1 : Fetch des cotes depuis The Odds API.
+        logger.info("Pipeline daily run started", dry_run=self.dry_run)
 
-        Récupère les cotes pour toutes les ligues configurées (settings.FOOTBALL_LEAGUES),
-        pour les marchés de la Phase 1 (h2h, totals, btts, asian_handicap, double_chance).
+        try:
+            await self._ensure_initialized()
 
-        Met à jour stats.matches_fetched.
+            # ── Étape 1 : Fetch des cotes ───────────────────────────────────
+            events = await self._step_fetch_odds(stats)
 
-        Args:
-            stats: Objet stats du run courant (mis à jour en place).
+            # ── Étape 2 : Prédictions ───────────────────────────────────────
+            bets = await self._step_predict_and_select(events, stats)
 
-        Returns:
-            Liste des matchs avec leurs cotes.
-        """
-        raise NotImplementedError
+            # ── Étape 3 : Envoi du coupon ───────────────────────────────────
+            if bets and not self.dry_run:
+                await self._step_send_coupon(bets, stats)
+            elif bets and self.dry_run:
+                logger.info("DRY RUN: skipping message send", n_bets=len(bets))
+                for bet in bets:
+                    logger.info(
+                        "Would send",
+                        match=bet.match_name,
+                        market=bet.market,
+                        ev=f"{bet.ev*100:.1f}%",
+                        odds=bet.odds,
+                    )
+            else:
+                logger.warning("No value bets found today")
 
-    async def _step_fetch_football_stats(
-        self, matches: list[Any], stats: PipelineRunStats
-    ) -> dict[str, Any]:
-        """
-        Étape 2 : Fetch des statistiques football depuis API-Football.
+            stats.status = PipelineStatus.SUCCESS
+            if stats.errors:
+                stats.status = PipelineStatus.PARTIAL_FAILURE
 
-        Pour chaque équipe dans les matchs du jour, récupère :
-        - Statistiques de la saison (buts pour/contre, xG si disponible)
-        - Forme récente (5 derniers matchs)
-        - H2H (5 derniers face-à-face)
+        except Exception as e:
+            logger.error("Pipeline failed", error=str(e))
+            stats.status = PipelineStatus.FAILURE
+            stats.error_message = str(e)
+            # Notifier l'admin
+            try:
+                await self.telegram.send_system_alert(
+                    f"Pipeline daily run FAILED:\n{str(e)}", level="ERROR"
+                )
+            except Exception:
+                pass
 
-        Args:
-            matches: Liste des matchs du jour (avec home_team_id, away_team_id).
-            stats: Objet stats du run courant.
+        finally:
+            stats.finished_at = datetime.now(timezone.utc)
+            logger.info(
+                "Pipeline run finished",
+                status=stats.status.value,
+                duration_s=round(stats.duration_seconds or 0, 1),
+                matches=stats.matches_fetched,
+                predictions=stats.predictions_made,
+                bets=stats.bets_selected,
+                alerts=stats.alerts_sent,
+            )
+            clear_context()
 
-        Returns:
-            Dict {team_id: TeamStats} avec les statistiques par équipe.
-        """
-        raise NotImplementedError
+        return stats
 
-    async def _step_predict(
-        self, matches: list[Any], team_stats: dict, stats: PipelineRunStats
+    async def _step_fetch_odds(self, stats: PipelineRunStats) -> list[dict]:
+        """Étape 1 : Récupère les cotes pour toutes les ligues configurées."""
+        logger.info("Step 1: Fetching odds")
+        try:
+            events = await self.odds_fetcher.fetch_all_leagues()
+            stats.matches_fetched = len(events)
+            logger.info("Odds fetched", n_events=len(events))
+            return events
+        except Exception as e:
+            stats.errors.append(f"Odds fetch failed: {e}")
+            logger.error("Odds fetch failed", error=str(e))
+            return []
+
+    async def _step_predict_and_select(
+        self, events: list[dict], stats: PipelineRunStats
     ) -> list[Any]:
-        """
-        Étape 3 : Génération des prédictions Dixon-Coles pour chaque match.
+        """Étapes 2+3 : Génère les prédictions et sélectionne les value bets."""
+        if not events:
+            return []
 
-        Charge le modèle calibré depuis la base de données (une instance par ligue).
-        Calcule la matrice de scores pour chaque match.
-        Dérive les probabilités pour chaque marché actif.
-        Sauvegarde les prédictions en base (table predictions).
+        logger.info("Step 2-3: Predicting and selecting value bets")
 
-        Args:
-            matches: Liste des matchs à prédire.
-            team_stats: Stats d'équipe collectées à l'étape précédente.
-            stats: Objet stats du run courant.
+        if not self.model.is_fitted:
+            logger.warning("Model not fitted, skipping predictions")
+            return []
 
-        Returns:
-            Liste des prédictions générées.
-        """
-        raise NotImplementedError
+        bets = self.selector.select_from_events(events, self.model)
+        stats.predictions_made = len(events) * 5  # 5 marchés par match
+        stats.bets_selected = len(bets)
 
-    async def _step_select_bets(
-        self, predictions: list[Any], stats: PipelineRunStats
-    ) -> list[Any]:
-        """
-        Étape 4 : Sélection des value bets.
+        # Sauvegarder les prédictions en base
+        if bets:
+            self._save_predictions_to_db(bets)
 
-        Applique la démarginisation sur les cotes bookmakers.
-        Calcule l'EV pour chaque prédiction.
-        Filtre selon EV_THRESHOLD, MIN_ODDS, MAX_ODDS.
-        Calcule le Kelly Criterion.
-        Sélectionne les MAX_BETS_PER_DAY meilleurs paris triés par EV décroissant.
+        return bets
 
-        Args:
-            predictions: Liste des prédictions générées à l'étape 3.
-            stats: Objet stats du run courant.
+    async def _step_send_coupon(self, bets: list[Any], stats: PipelineRunStats) -> None:
+        """Étape 4 : Envoie le coupon WhatsApp (avec fallback Telegram)."""
+        logger.info("Step 4: Sending coupon", n_bets=len(bets))
 
-        Returns:
-            Liste des value bets sélectionnés (max MAX_BETS_PER_DAY).
-        """
-        raise NotImplementedError
+        wa_results = await self.whatsapp.send_coupon(bets)
+        wa_success = sum(1 for r in wa_results if r.success)
+        stats.alerts_sent += wa_success
 
-    async def _step_send_coupon(
-        self, bets: list[Any], stats: PipelineRunStats
-    ) -> None:
-        """
-        Étape 5 : Envoi du coupon via WhatsApp (avec fallback Telegram).
+        # Fallback Telegram si WhatsApp échoue ou n'est pas configuré
+        if wa_success == 0 or not settings.whatsapp_enabled:
+            tg_results = await self.telegram.send_coupon(bets)
+            stats.alerts_sent += sum(1 for r in tg_results if r)
 
-        Formate le coupon via CouponFormatter.
-        Tente l'envoi WhatsApp pour chaque destinataire configuré.
-        Si WhatsApp échoue entièrement, bascule sur Telegram.
-        Sauvegarde chaque envoi dans la table `alerts`.
+        logger.info(
+            "Coupon sent",
+            wa_sent=wa_success,
+            total_sent=stats.alerts_sent,
+        )
 
-        Args:
-            bets: Liste des value bets sélectionnés.
-            stats: Objet stats du run courant (stats.alerts_sent mis à jour).
-        """
-        raise NotImplementedError
+    def _save_predictions_to_db(self, bets: list[Any]) -> None:
+        """Sauvegarde les prédictions sélectionnées en base."""
+        try:
+            from src.data.models.match import Match
+            from src.data.models.prediction import Prediction
 
-    async def _save_run_stats(self, stats: PipelineRunStats) -> None:
-        """
-        Sauvegarde les statistiques du run en base de données (table pipeline_runs).
+            with get_db() as db:
+                for bet in bets:
+                    # Upsert match
+                    match = db.query(Match).filter(
+                        Match.external_id == bet.match_id
+                    ).first()
+                    if not match:
+                        match = Match(
+                            external_id=bet.match_id or f"auto_{bet.match_name}",
+                            sport="football",
+                            league=bet.league,
+                            home_team=bet.match_name.split(" vs ")[0],
+                            away_team=bet.match_name.split(" vs ")[-1],
+                            kickoff_utc=bet.kickoff_utc,
+                        )
+                        db.add(match)
+                        db.flush()
 
-        Args:
-            stats: Statistiques complètes du run terminé.
-        """
-        raise NotImplementedError
-
-    async def _notify_admin_on_failure(self, stats: PipelineRunStats) -> None:
-        """
-        Envoie une notification à l'administrateur en cas d'échec critique.
-
-        Utilise Telegram (plus fiable que WhatsApp pour les alertes système).
-
-        Args:
-            stats: Statistiques du run avec les informations d'erreur.
-        """
-        raise NotImplementedError
+                    pred = Prediction(
+                        match_id=match.id,
+                        market=bet.market,
+                        outcome=bet.outcome,
+                        model_prob=bet.model_prob,
+                        best_bookmaker=bet.bookmaker,
+                        best_odds=bet.odds,
+                        fair_odds=bet.fair_odds,
+                        ev=bet.ev,
+                        kelly_fraction=bet.kelly_pct,
+                        confidence=bet.confidence,
+                    )
+                    db.add(pred)
+                db.commit()
+                logger.info("Predictions saved to DB", n=len(bets))
+        except Exception as e:
+            logger.error("Failed to save predictions", error=str(e))
 
     def run(self) -> None:
-        """
-        Lance le scheduler APScheduler avec tous les jobs configurés.
+        """Lance le scheduler APScheduler complet."""
+        from src.scheduler.jobs import configure_scheduler
 
-        Jobs configurés :
-        - job_daily_pipeline  : tous les jours à settings.DAILY_PIPELINE_HOUR:DAILY_PIPELINE_MINUTE UTC
-        - job_hourly_odds     : toutes les settings.ODDS_FETCH_INTERVAL_MINUTES minutes
-        - job_live_odds       : toutes les settings.ODDS_FETCH_LIVE_INTERVAL_MINUTES minutes (matchs J0)
-        - job_weekly_report   : chaque lundi à 09h00 UTC
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
 
-        Gère les signaux SIGTERM et SIGINT pour un arrêt propre.
-        """
-        raise NotImplementedError
+        scheduler = configure_scheduler(self)
+
+        # Gestion gracieuse des signaux
+        def shutdown(sig: int, frame: Any) -> None:
+            logger.info("Shutdown signal received", signal=sig)
+            scheduler.shutdown(wait=False)
+            loop.stop()
+
+        signal.signal(signal.SIGTERM, shutdown)
+        signal.signal(signal.SIGINT, shutdown)
+
+        logger.info(
+            "Apex Bot V2 scheduler starting",
+            send_hour=settings.BOT_SEND_HOUR,
+            send_minute=settings.BOT_SEND_MINUTE,
+            demo_mode=settings.DEMO_MODE,
+        )
+
+        scheduler.start()
+        try:
+            loop.run_forever()
+        finally:
+            loop.close()
+            logger.info("Scheduler stopped")
 
 
 def main() -> None:
-    """
-    Point d'entrée CLI du pipeline.
-
-    Arguments :
-        --run-once : Exécute le pipeline une seule fois et s'arrête.
-        --dry-run  : N'envoie pas de messages WhatsApp/Telegram.
-    """
     parser = argparse.ArgumentParser(description="Apex Bot V2 — Pipeline de prédiction sportive")
-    parser.add_argument(
-        "--run-once",
-        action="store_true",
-        help="Exécuter le pipeline une seule fois sans démarrer le scheduler.",
-    )
-    parser.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="Ne pas envoyer de messages WhatsApp/Telegram (mode test).",
-    )
+    parser.add_argument("--run-once", action="store_true", help="Exécuter une seule fois")
+    parser.add_argument("--dry-run", action="store_true", help="Sans envoi de messages")
     args = parser.parse_args()
 
     pipeline = Pipeline(dry_run=args.dry_run)
 
     if args.run_once:
         stats = asyncio.run(pipeline.run_daily())
-        sys.exit(0 if stats.status in (PipelineStatus.SUCCESS, PipelineStatus.PARTIAL_FAILURE) else 1)
+        code = 0 if stats.status in (PipelineStatus.SUCCESS, PipelineStatus.PARTIAL_FAILURE) else 1
+        sys.exit(code)
     else:
         pipeline.run()
 

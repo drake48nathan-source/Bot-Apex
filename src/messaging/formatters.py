@@ -1,128 +1,125 @@
 """
 Formateurs de messages pour WhatsApp et Telegram.
-
-Trois types de messages sont générés :
-1. Coupon quotidien : liste des top value bets du jour
-2. Alerte value bet : notification d'un seul pari de haute valeur
-3. Analyse match : rapport détaillé d'un match avec stats et prédictions
-
-Les messages sont formatés avec du texte unicode (compatible WhatsApp et Telegram).
-Les caractères spéciaux Telegram (MarkdownV2) sont échappés automatiquement.
-
-Limite WhatsApp : 4096 caractères. Les messages trop longs sont tronqués intelligemment.
-
-Usage:
-    formatter = CouponFormatter()
-    text = formatter.format(bets=[bet1, bet2, bet3], date=datetime.utcnow())
-
-    alert_fmt = AlertFormatter()
-    text = alert_fmt.format(bet=bet1)
 """
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
+
+from src.core.config import settings
+
+
+CONFIDENCE_STARS = {"low": "⭐", "medium": "⭐⭐", "high": "⭐⭐⭐"}
+
+SEPARATOR = "━" * 28
 
 
 class CouponFormatter:
     """Formate le coupon quotidien de value bets."""
 
-    MAX_LENGTH: int = 4096  # Limite WhatsApp
+    MAX_LENGTH = 4096
 
     def format(self, bets: list[Any], date: datetime | None = None) -> str:
-        """
-        Génère le message texte du coupon quotidien.
+        if date is None:
+            date = datetime.now()
 
-        Format généré (voir WHATSAPP_SETUP.md pour l'exemple complet) :
-            🎯 APEX BOT — Coupon du DD/MM/YYYY
-            [séparateur]
-            N. Équipe A vs Équipe B
-               Marché : [label]
-               Cote : X.XX @ [bookmaker]
-               EV : +X.X% | Kelly : X.X%
-               Confiance : [étoiles]
-            [séparateur]
-            📈 EV moyen : +X.X%
-            ⚠️ Paris à titre informatif uniquement
+        date_str = date.strftime("%d/%m/%Y")
+        lines = [
+            f"🎯 *APEX BOT — Coupon du {date_str}*",
+            "",
+            f"📊 FOOTBALL — {len(bets)} value bet{'s' if len(bets) > 1 else ''}",
+            SEPARATOR,
+            "",
+        ]
 
-        Args:
-            bets: Liste de SelectedBet (ou dicts équivalents) à inclure.
-            date: Date du coupon (datetime UTC). Utilise utcnow() si None.
+        for i, bet in enumerate(bets, 1):
+            lines.extend(self._format_single_bet(bet, i))
+            lines.append("")
 
-        Returns:
-            Texte formaté, max 4096 caractères. Tronqué si besoin.
-        """
-        raise NotImplementedError
+        lines.append(SEPARATOR)
 
-    def _format_single_bet(self, bet: Any, index: int) -> str:
-        """
-        Formate un seul pari pour inclusion dans le coupon.
+        if bets:
+            avg_ev = sum(b.ev for b in bets) / len(bets)
+            lines.append(f"📈 EV moyen du coupon : +{avg_ev * 100:.1f}%")
 
-        Args:
-            bet: SelectedBet ou dict avec les champs requis.
-            index: Numéro du pari dans le coupon (1-based).
+        lines.extend([
+            f"💰 Mise recommandée : 2-3% de bankroll par pari",
+            "",
+            "⚠️ _Paris à titre informatif uniquement_",
+            "_Jouez de manière responsable_",
+        ])
 
-        Returns:
-            Bloc de texte pour ce pari (5-7 lignes).
-        """
-        raise NotImplementedError
+        text = "\n".join(lines)
+        if len(text) > self.MAX_LENGTH:
+            text = text[: self.MAX_LENGTH - 20] + "\n...[tronqué]"
+        return text
 
-    def _confidence_stars(self, confidence: str) -> str:
-        """
-        Convertit le niveau de confiance en étoiles unicode.
+    def _format_single_bet(self, bet: Any, index: int) -> list[str]:
+        stars = CONFIDENCE_STARS.get(getattr(bet, "confidence", "medium"), "⭐⭐")
+        kickoff = getattr(bet, "kickoff_utc", None)
+        if kickoff:
+            try:
+                kickoff_str = kickoff.strftime("%H:%M UTC")
+            except Exception:
+                kickoff_str = ""
+        else:
+            kickoff_str = ""
 
-        'low' → '⭐'
-        'medium' → '⭐⭐'
-        'high' → '⭐⭐⭐'
-        """
-        raise NotImplementedError
+        label = getattr(bet, "outcome_label", bet.outcome) if hasattr(bet, "outcome_label") else str(bet)
+        ev_str = getattr(bet, "ev_pct", f"+{bet.ev*100:.1f}%") if hasattr(bet, "ev_pct") else ""
+        kelly_str = getattr(bet, "kelly_pct_str", "") if hasattr(bet, "kelly_pct_str") else ""
 
-    def _market_label(self, market: str, outcome: str) -> str:
-        """
-        Retourne un label lisible pour un marché/outcome.
-
-        Exemples :
-            ('h2h', 'home') → 'Victoire [équipe domicile]'
-            ('totals', 'over_2.5') → 'Plus de 2.5 buts'
-            ('btts', 'yes') → 'Les deux équipes marquent'
-            ('double_chance', '1X') → 'Domicile ou Nul'
-
-        Args:
-            market: Clé du marché ('h2h', 'totals', 'btts', etc.).
-            outcome: Outcome spécifique.
-
-        Returns:
-            Label français lisible.
-        """
-        raise NotImplementedError
+        return [
+            f"*{index}️⃣  {bet.match_name}*  {kickoff_str}",
+            f"   Marché : {label}",
+            f"   Cote : {bet.odds:.2f} @ {bet.bookmaker.upper()}",
+            f"   EV : {ev_str} | Kelly : {kelly_str}",
+            f"   Confiance : {stars}",
+        ]
 
 
 class AlertFormatter:
-    """Formate les alertes value bet unitaires (temps réel ou seuil EV élevé)."""
+    """Formate les alertes value bet unitaires."""
 
     def format(self, bet: Any, trigger_reason: str = "value_bet") -> str:
-        """
-        Génère le message d'alerte pour un seul pari.
+        reason_labels = {
+            "value_bet": "Value bet détecté",
+            "line_movement": "Mouvement de cote",
+            "high_ev": "EV exceptionnel",
+        }
+        reason_label = reason_labels.get(trigger_reason, trigger_reason)
 
-        Format généré :
-            ⚡ ALERTE VALUE BET
-            [match + horaire]
-            [marché + cote + EV + Kelly]
-            [raison de l'alerte]
+        kickoff = getattr(bet, "kickoff_utc", None)
+        kickoff_str = ""
+        if kickoff:
+            try:
+                kickoff_str = kickoff.strftime("%d/%m %H:%M UTC")
+            except Exception:
+                pass
 
-        Args:
-            bet: SelectedBet ou dict avec les informations du pari.
-            trigger_reason: Raison de l'alerte ('value_bet', 'line_movement', 'high_ev').
+        label = getattr(bet, "outcome_label", bet.outcome) if hasattr(bet, "outcome_label") else ""
+        ev_str = getattr(bet, "ev_pct", "") if hasattr(bet, "ev_pct") else ""
+        kelly_str = getattr(bet, "kelly_pct_str", "") if hasattr(bet, "kelly_pct_str") else ""
 
-        Returns:
-            Texte de l'alerte, max 1000 caractères.
-        """
-        raise NotImplementedError
+        return "\n".join([
+            f"⚡ *ALERTE VALUE BET — {reason_label}*",
+            "",
+            f"⚽ *{bet.match_name}*",
+            f"🕐 Coup d'envoi : {kickoff_str}",
+            "",
+            f"📊 Marché : {label}",
+            f"💶 Cote : {bet.odds:.2f} @ {bet.bookmaker.upper()}",
+            f"📈 EV : {ev_str}",
+            f"⚖️ Kelly : {kelly_str}",
+            "",
+            SEPARATOR,
+            "⚠️ _Information uniquement | Vérifiez les cotes avant de parier_",
+        ])
 
 
 class AnalysisFormatter:
-    """Formate l'analyse complète d'un match (stats + prédictions + value bets)."""
+    """Formate l'analyse détaillée d'un match."""
 
     def format(
         self,
@@ -131,39 +128,50 @@ class AnalysisFormatter:
         selected_bets: list[Any],
         team_stats: dict[str, Any] | None = None,
     ) -> str:
-        """
-        Génère l'analyse complète d'un match.
+        home = getattr(match, "home_team", "Home")
+        away = getattr(match, "away_team", "Away")
 
-        Format généré :
-            🔍 ANALYSE — Équipe A vs Équipe B
-            [date + heure + stade]
-            [prédictions modèle : victoires, nul, O/U, BTTS]
-            [forme récente des deux équipes]
-            [H2H]
-            [value bets détectés]
-            [avertissement]
+        lines = [
+            f"🔍 *ANALYSE — {home} vs {away}*",
+            "",
+            SEPARATOR,
+            "*📊 PRÉDICTIONS MODÈLE*",
+            "",
+        ]
 
-        Args:
-            match: Objet Match SQLAlchemy.
-            predictions: Liste de Prediction pour ce match.
-            selected_bets: Value bets sélectionnés pour ce match.
-            team_stats: Stats supplémentaires des équipes (optionnel).
+        # Afficher les prédictions disponibles
+        for pred in predictions:
+            market = getattr(pred, "market", "")
+            outcome = getattr(pred, "outcome", "")
+            prob = getattr(pred, "model_prob", 0.0)
+            ev = getattr(pred, "ev", None)
+            ev_str = f"  EV: +{ev*100:.1f}%" if ev and ev > 0 else ""
+            lines.append(f"   {market}/{outcome}: {prob*100:.1f}%{ev_str}")
 
-        Returns:
-            Texte de l'analyse, max 4096 caractères.
-        """
-        raise NotImplementedError
+        lines.append("")
+        lines.append(SEPARATOR)
 
-    def _format_form(self, form_string: str) -> str:
-        """
-        Formate la forme récente en caractères colorés unicode.
+        if selected_bets:
+            lines.append("*⚡ VALUE BETS DÉTECTÉS*")
+            lines.append("")
+            for bet in selected_bets:
+                ev_str = getattr(bet, "ev_pct", "")
+                label = getattr(bet, "outcome_label", bet.outcome) if hasattr(bet, "outcome_label") else ""
+                lines.append(f"✅ {label} @ {bet.odds:.2f} — EV {ev_str}")
+            lines.append("")
+            lines.append(SEPARATOR)
 
-        'WWDLW' → 'W W D L W' avec émoticônes si possible.
+        lines.extend([
+            "",
+            "⚠️ _Information uniquement | Pariez de manière responsable_",
+        ])
 
-        Args:
-            form_string: Chaîne de 5 résultats ('W', 'D', 'L').
+        return "\n".join(lines)
 
-        Returns:
-            Chaîne formatée pour l'affichage.
-        """
-        raise NotImplementedError
+
+class SystemAlertFormatter:
+    """Formate les alertes système (erreurs pipeline, etc.)."""
+
+    def format(self, message: str, level: str = "WARNING") -> str:
+        icon = "🚨" if level == "ERROR" else "⚠️"
+        return f"{icon} *SYSTÈME APEX BOT*\n\n{message}"
