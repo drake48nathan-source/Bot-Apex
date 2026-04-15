@@ -87,7 +87,7 @@ dmypy.json
 *.ipynb
 
 # ─── Données locales ─────────────────────────────────────────────────────────
-data/
+/data/
 !data/.gitkeep
 !src/data/
 !src/data/**
