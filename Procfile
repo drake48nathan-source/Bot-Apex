@@ -1,1 +1,1 @@
-worker: python -m src.scheduler.pipeline
+worker: PYTHONPATH=/app python -m src.scheduler.pipeline

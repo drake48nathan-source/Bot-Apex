@@ -89,6 +89,8 @@ dmypy.json
 # ─── Données locales ─────────────────────────────────────────────────────────
 data/
 !data/.gitkeep
+!src/data/
+!src/data/**
 
 # ─── Modèles calibrés (trop lourds pour git) ─────────────────────────────────
 models_cache/
