@@ -9,7 +9,7 @@ Usage:
     api_key = settings.ODDS_API_KEY
     if settings.DEMO_MODE:
         return DEMO_DATA
-"""h
+"""
 
 from __future__ import annotations
 
