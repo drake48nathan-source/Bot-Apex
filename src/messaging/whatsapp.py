@@ -1,5 +1,7 @@
 """
-Client WhatsApp via Meta Cloud API.
+Client WhatsApp via WaAPI (WhatsApp Web API).
+Instance : #88855 — Compte BetForge (+229 51303765)
+Doc API  : https://waapi.app/api-doc
 """
 
 from __future__ import annotations
@@ -24,130 +26,116 @@ class SendResult:
     message_id: str = ""
     error_code: int | None = None
     error_message: str = ""
+    sent_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+
+    def __bool__(self) -> bool:
+        return self.success
 
 
 class WhatsAppClient:
-    """Client pour l'API Meta WhatsApp Cloud."""
+    """
+    Envoie des messages WhatsApp via l'API REST WaAPI.
+    Endpoint : POST /api/v1/instances/{instanceId}/client/action/send-message
+    Auth     : Bearer token dans le header Authorization.
+    """
+
+    BASE_URL = "https://waapi.app/api/v1"
 
     def __init__(self) -> None:
-        self._coupon_fmt = CouponFormatter()
-        self._alert_fmt = AlertFormatter()
-        self._client: httpx.AsyncClient | None = None
+        self._instance_id = settings.WAAPI_INSTANCE_ID
+        self._token = settings.WAAPI_TOKEN
+        self._recipient = settings.WAAPI_RECIPIENT
+        self._timeout = httpx.Timeout(30.0)
 
-    def _get_client(self) -> httpx.AsyncClient:
-        if self._client is None or self._client.is_closed:
-            self._client = httpx.AsyncClient(
-                headers={"Authorization": f"Bearer {settings.WHATSAPP_TOKEN}"},
-                timeout=10.0,
-            )
-        return self._client
+    async def send_text(self, chat_id: str, text: str) -> SendResult:
+        """Envoie un message texte brut a un chat_id WaAPI (ex: 2290XXXXXXXXX@c.us)."""
+        if not self._is_configured():
+            logger.warning("WhatsApp desactive — variables WAAPI_* manquantes")
+            return SendResult(success=False, recipient=chat_id, error_message="not_configured")
 
-    async def send_text_message(self, to: str, text: str) -> SendResult:
-        """Envoie un message texte à un numéro WhatsApp."""
-        if settings.DEMO_MODE or not settings.whatsapp_enabled:
-            logger.info("DEMO_MODE/disabled: skipping WhatsApp send", to=to, length=len(text))
-            return SendResult(success=True, recipient=to, message_id="demo_msg_id")
-
-        payload = self._build_text_payload(to, text)
-        return await self._post_message(payload, to)
-
-    async def send_coupon(self, bets: list[Any]) -> list[SendResult]:
-        """Envoie le coupon à tous les destinataires configurés."""
-        text = self._coupon_fmt.format(bets)
-        return await self.send_to_all(text, message_type="daily_coupon")
-
-    async def send_alert(self, bet: Any, trigger_reason: str = "value_bet") -> list[SendResult]:
-        """Envoie une alerte value bet à tous les destinataires."""
-        text = self._alert_fmt.format(bet, trigger_reason)
-        return await self.send_to_all(text, message_type="value_bet")
-
-    async def send_to_all(self, text: str, message_type: str = "text") -> list[SendResult]:
-        """Envoie un message à tous les destinataires configurés."""
-        recipients = [settings.WHATSAPP_RECIPIENT_NUMBER] if settings.WHATSAPP_RECIPIENT_NUMBER else []
-        if not recipients:
-            logger.warning("No WhatsApp recipients configured")
-            return []
-
-        results: list[SendResult] = []
-        for recipient in recipients:
-            result = await self.send_text_message(recipient, text)
-            results.append(result)
-            if result.success:
-                logger.info("WhatsApp sent", to=recipient, type=message_type)
-            else:
-                logger.error(
-                    "WhatsApp send failed",
-                    to=recipient,
-                    error_code=result.error_code,
-                    error_message=result.error_message,
-                )
-        return results
-
-    def _build_text_payload(self, to: str, text: str) -> dict[str, Any]:
-        # Tronquer si nécessaire
-        if len(text) > 4096:
-            text = text[:4076] + "\n...[tronqué]"
-        return {
-            "messaging_product": "whatsapp",
-            "recipient_type": "individual",
-            "to": to,
-            "type": "text",
-            "text": {"preview_url": False, "body": text},
+        url = f"{self.BASE_URL}/instances/{self._instance_id}/client/action/send-message"
+        payload = {"chatId": chat_id, "message": text}
+        headers = {
+            "Authorization": f"Bearer {self._token}",
+            "Content-Type": "application/json",
+            "Accept": "application/json",
         }
 
-    async def _post_message(self, payload: dict[str, Any], recipient: str) -> SendResult:
-        """POST vers l'API Meta et parse la réponse."""
-        url = settings.whatsapp_base_url
-        client = self._get_client()
         try:
-            resp = await client.post(url, json=payload)
-            data = resp.json()
+            async with httpx.AsyncClient(timeout=self._timeout) as client:
+                response = await client.post(url, json=payload, headers=headers)
 
-            if resp.status_code == 200:
-                messages = data.get("messages", [{}])
-                msg_id = messages[0].get("id", "") if messages else ""
-                return SendResult(success=True, recipient=recipient, message_id=msg_id)
+            if response.status_code == 200:
+                data = response.json()
+                msg_id = (
+                    data.get("data", {}).get("id", "")
+                    or data.get("id", "")
+                    or "sent"
+                )
+                logger.info("WhatsApp OK", chat_id=chat_id, msg_id=msg_id)
+                return SendResult(success=True, recipient=chat_id, message_id=str(msg_id))
 
-            # Gestion des erreurs Meta
-            error = data.get("error", {})
-            code = error.get("code", resp.status_code)
-            message = error.get("message", str(data))
-
-            # Alertes spécifiques
-            if code == 190:
-                logger.critical("WhatsApp token expired! Renew WHATSAPP_TOKEN.")
-            elif code == 131047:
-                logger.warning("Message outside 24h window, use template instead.")
-            elif code == 131056:
-                logger.warning("WhatsApp quota reached, retry later.")
-
+            logger.error(
+                "WhatsApp erreur HTTP",
+                status=response.status_code,
+                body=response.text[:300],
+            )
             return SendResult(
                 success=False,
-                recipient=recipient,
-                error_code=code,
-                error_message=message,
-            )
-        except httpx.TimeoutException:
-            return SendResult(
-                success=False,
-                recipient=recipient,
-                error_code=-1,
-                error_message="Request timeout",
-            )
-        except Exception as e:
-            return SendResult(
-                success=False,
-                recipient=recipient,
-                error_code=-1,
-                error_message=str(e),
+                recipient=chat_id,
+                error_code=response.status_code,
+                error_message=response.text[:200],
             )
 
-    async def close(self) -> None:
-        if self._client and not self._client.is_closed:
-            await self._client.aclose()
+        except httpx.TimeoutException as exc:
+            logger.error("WhatsApp timeout", error=str(exc))
+            return SendResult(success=False, recipient=chat_id, error_message="timeout")
+        except Exception as exc:
+            logger.error("WhatsApp exception", error=str(exc))
+            return SendResult(success=False, recipient=chat_id, error_message=str(exc))
 
-    async def __aenter__(self) -> "WhatsAppClient":
-        return self
+    async def send_coupon(self, predictions: list[Any]) -> SendResult:
+        """Formate et envoie le coupon du jour."""
+        text = CouponFormatter.format(predictions)
+        return await self.send_text(self._recipient, text)
 
-    async def __aexit__(self, *args: Any) -> None:
-        await self.close()
+    async def send_alert(self, message: str, level: str = "info") -> SendResult:
+        """Envoie une alerte admin."""
+        text = AlertFormatter.format(message, level)
+        return await self.send_text(self._recipient, text)
+
+    async def send_raw(self, text: str, chat_id: str | None = None) -> SendResult:
+        """Envoie un message texte libre."""
+        target = chat_id or self._recipient
+        return await self.send_text(target, text)
+
+    def _is_configured(self) -> bool:
+        return bool(self._instance_id and self._token and self._recipient)
+
+    @property
+    def is_enabled(self) -> bool:
+        return self._is_configured() and not settings.DEMO_MODE
+
+    async def health_check(self) -> dict[str, Any]:
+        """Verifie que l'instance WaAPI est Ready."""
+        if not self._is_configured():
+            return {"status": "disabled", "reason": "not_configured"}
+
+        url = f"{self.BASE_URL}/instances/{self._instance_id}/client/status"
+        headers = {
+            "Authorization": f"Bearer {self._token}",
+            "Accept": "application/json",
+        }
+
+        try:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(10.0)) as client:
+                response = await client.get(url, headers=headers)
+            if response.status_code == 200:
+                return {"status": "ok", "data": response.json()}
+            return {"status": "error", "code": response.status_code}
+        except Exception as exc:
+            return {"status": "error", "reason": str(exc)}
+
+
+# Singleton exporte
+whatsapp_client = WhatsAppClient()
