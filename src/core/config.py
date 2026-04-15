@@ -9,7 +9,7 @@ Usage:
     api_key = settings.ODDS_API_KEY
     if settings.DEMO_MODE:
         return DEMO_DATA
-"""
+"""h
 
 from __future__ import annotations
 
@@ -58,7 +58,9 @@ class Settings(BaseSettings):
     BALLDONTLIE_API_KEY: str = ""
 
     # ─── WhatsApp Meta Cloud API ──────────────────────────────────────────────
-    WHATSAPP_TOKEN: str = ""
+    WAAPI_INSTANCE_ID: str = ""
+    WAAPI_TOKEN: str = ""
+    WAAPI_RECIPIENT: str = ""
     WHATSAPP_PHONE_NUMBER_ID: str = ""
     WHATSAPP_RECIPIENT_NUMBER: str = ""
     WHATSAPP_API_VERSION: str = "v19.0"
@@ -102,7 +104,7 @@ class Settings(BaseSettings):
 
     @property
     def whatsapp_enabled(self) -> bool:
-        return bool(self.WHATSAPP_TOKEN and self.WHATSAPP_PHONE_NUMBER_ID and not self.DEMO_MODE)
+        return bool(self.WAAPI_TOKEN and self.WAAPI_INSTANCE_ID and not self.DEMO_MODE)
 
     @property
     def telegram_enabled(self) -> bool:
@@ -113,7 +115,7 @@ class Settings(BaseSettings):
         return [l.strip() for l in self.FOOTBALL_LEAGUES.split(",") if l.strip()]
 
     @property
-    def whatsapp_base_url(self) -> str:
+    def waapi_base_url(self) -> str:
         return (
             f"https://graph.facebook.com/{self.WHATSAPP_API_VERSION}"
             f"/{self.WHATSAPP_PHONE_NUMBER_ID}/messages"
